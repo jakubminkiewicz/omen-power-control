@@ -1,0 +1,1 @@
+obj-m := omen_ctgp.o omen_spg.o

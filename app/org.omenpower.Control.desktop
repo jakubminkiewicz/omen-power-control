@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OMEN Power Control
+Comment=Manage the OMEN AC power service and firmware settings
+Exec=/usr/bin/omen-power-control
+Icon=preferences-system-power-management
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=OMEN;power;cooling;fan;GPU;CPU;
+StartupNotify=true

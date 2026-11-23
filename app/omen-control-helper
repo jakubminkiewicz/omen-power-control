@@ -1,0 +1,626 @@
+#!/usr/bin/python3 -I
+"""Read OMEN state and perform the app's fixed administrator operations."""
+
+import argparse
+from configparser import ConfigParser, Error as ConfigError
+import csv
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile
+import time
+from uuid import uuid4
+
+
+HERE = Path(__file__).resolve().parent
+SOURCE = HERE / 'service' if (HERE / 'service').is_dir() else HERE.parent / 'service'
+POWER = runpy.run_path(str(SOURCE / 'omen-ac-power.py'))
+SERVICE = 'omen-ac-power.service'
+KEY_ENROLLMENT_REQUIRED = 75
+SYSTEMCTL = '/usr/bin/systemctl'
+JOURNALCTL = '/usr/bin/journalctl'
+UNIT = Path('/etc/systemd/system') / SERVICE
+CONTROLLER = Path('/usr/local/libexec/omen-ac-power.py')
+CPU_DEFAULTS = CONTROLLER.with_name(POWER['CPU_DEFAULTS'].name)
+GPU_RECOVERY = CONTROLLER.with_name(POWER['GPU_RECOVERY_WORKER'].name)
+DMI = Path('/sys/class/dmi/id')
+PROFILE = POWER['PROFILE']
+AC = POWER['AC']
+REAR = POWER['REAR']
+FRONT = REAR.parent.with_name('ucsi-source-psy-USBC000:001') / 'online'
+CHOICES = PROFILE.with_name('platform_profile_choices')
+CTGP = Path('/sys/module/omen_ctgp/parameters/ctgp')
+GAIN = Path('/sys/module/omen_spg/parameters/gain_watts')
+PROFILE_BUS = 'org.freedesktop.UPower.PowerProfiles'
+PROFILE_OBJECT = '/org/freedesktop/UPower/PowerProfiles'
+PROFILES = {'cool': 'power-saver', 'balanced': 'balanced', 'performance': 'performance'}
+HARDWARE = {'board_vendor': 'HP', 'board_name': '8C58', 'product_sku': '9R293EA#ABU', 'bios_version': 'F.13'}
+TUNED_PPD = Path('/etc/tuned/ppd.conf')
+TUNED_PROFILES = TUNED_PPD.parent / 'profiles'
+TUNED_VENDOR = Path('/usr/lib/tuned/profiles')
+TUNED_BUS = ['/usr/bin/busctl', '--system', '--timeout=25s', 'call',
+             'com.redhat.tuned', '/Tuned', 'com.redhat.tuned.control']
+CPUFREQ = Path('/sys/devices/system/cpu/cpufreq')
+INTEL_PSTATE = CPUFREQ.with_name('intel_pstate')
+PERFORMANCE_CPU_SETTINGS = {
+    'powersave': {'governor': 'powersave', 'min_perf_pct': '0',
+                  'energy_performance_preference': 'balance_performance', 'energy_perf_bias': 'normal'},
+    # Meteor Lake maps the named performance EPP to a nonzero value. The
+    # performance governor accepts raw EPP 0, which it also selects by default.
+    'performance': {'governor': 'performance', 'min_perf_pct': '100',
+                    'energy_performance_preference': '0', 'energy_perf_bias': 'performance'},
+}
+
+
+def read(path):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def number(path):
+    value = read(path)
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def run(command, timeout=8, *, check=True):
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    if check and result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip()
+                           or f'{Path(command[0]).name} exited with status {result.returncode}')
+    return result
+
+
+def supported():
+    return all(read(DMI / field) == expected for field, expected in HARDWARE.items())
+
+
+def unit_state(unit):
+    output = run([SYSTEMCTL, 'show', unit, '--no-pager',
+                  '--property=LoadState,ActiveState,UnitFileState,MainPID'], check=False).stdout
+    return dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+
+
+def installed(state):
+    return state.get('LoadState') in {'loaded', 'masked', 'error', 'bad-setting'} or UNIT.is_file()
+
+
+def current_service():
+    files = (CONTROLLER, CPU_DEFAULTS, UNIT, GPU_RECOVERY)
+    try:
+        return all(path.read_bytes() == (SOURCE / path.name).read_bytes() for path in files)
+    except OSError:
+        return False
+
+
+def control_status(state):
+    try:
+        status = json.loads(POWER['CONTROL_STATUS'].read_text())
+        if status['version'] == POWER['CONTROL_VERSION'] and str(status['pid']) == state.get('MainPID'):
+            return status
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def limits(zone):
+    path = POWER['CAP'] / zone
+    return [number(path / f'constraint_{index}_power_limit_uw') for index in (0, 1, 2)]
+
+
+def tune_config(text, *, profile=False):
+    if profile:
+        config = ConfigParser(interpolation=None, delimiters=('=',), inline_comment_prefixes=('#',), strict=False)
+        config.optionxform = str
+    else:
+        config = ConfigParser()
+    config.read_string(text)
+    return config
+
+
+def tuned_override(text, section, settings):
+    config = tune_config(text, profile=True)
+    changes = {key: value for key, value in settings.items() if config.get(section, key, fallback=None) != value}
+    if not changes:
+        return text
+    in_section = False
+    section_index = None
+    matches = {}
+    lines = text.splitlines(keepends=True)
+    newline = '\r\n' if '\r\n' in text else '\n'
+    option = re.compile(r'^([ \t]*([\w-]+)[ \t]*=[ \t]*)[^\r\n]*?([ \t]+#[^\r\n]*)?(\r?\n)?$')
+    for index, line in enumerate(lines):
+        if header := re.match(r'^[ \t]*\[([^]]+)\]', line):
+            in_section = header[1] == section
+            if in_section:
+                section_index = index
+        elif in_section and (match := option.fullmatch(line)) and match[2] in changes:
+            matches[match[2]] = index, match
+    # Update the last occurrence and retain comments, whitespace and other options.
+    for key, (index, match) in matches.items():
+        lines[index] = match[1] + changes[key] + (match[3] or '') + (match[4] or '')
+    missing = [f'{key}={value}{newline}' for key, value in changes.items() if key not in matches]
+    if section_index is None:
+        patched = text.rstrip('\r\n') + f'{newline}{newline}[{section}]{newline}' + ''.join(missing)
+    else:
+        lines[section_index] += '' if lines[section_index].endswith('\n') else newline
+        lines[section_index + 1:section_index + 1] = missing
+        patched = ''.join(lines)
+    config = tune_config(patched, profile=True)
+    if any(config.get(section, key, fallback=None) != value for key, value in settings.items()):
+        raise ValueError(f'The local TuneD [{section}] settings could not be updated in place.')
+    return patched
+
+
+def tuned_profile_sources(mode):
+    label = mode.replace('-', ' ').title()
+    ppd = tune_config(TUNED_PPD.read_text())
+    on_ac = dict(ppd['profiles']) if 'profiles' in ppd else {}
+    on_battery = on_ac.copy()
+    if ppd.getboolean('main', 'battery_detection', fallback='battery' in ppd) and 'battery' in ppd:
+        on_battery.update(ppd['battery'])
+    targets = {mapping.get(mode, '') for mapping in (on_ac, on_battery)}
+    other = {name for mapping in (on_ac, on_battery) for key, name in mapping.items() if key != mode}
+    if targets & other:
+        raise ValueError(f'{label} shares a TuneD profile with another desktop power mode.')
+    if any(not re.fullmatch(r'[a-zA-Z0-9_][a-zA-Z0-9_.-]*', name) for name in targets):
+        raise ValueError(f'A TuneD {label} profile could not be identified in ppd.conf.')
+    sources = {}
+    for name in sorted(targets):
+        path = TUNED_PROFILES / name / 'tuned.conf'
+        if not path.resolve().is_relative_to(TUNED_PROFILES.resolve()):
+            raise ValueError(f'{path} resolves outside the local TuneD profiles directory.')
+        try:
+            before = path.read_text(newline='')
+        except FileNotFoundError:
+            if not (TUNED_VENDOR / name / 'tuned.conf').is_file():
+                raise ValueError(f'TuneD profile {name} is missing.') from None
+            before = None
+        sources[path] = before
+    return sources
+
+
+def tuned_changes(sources, section, settings):
+    changes = {}
+    for path, before in sources.items():
+        base = before if before is not None else f'[main]\ninclude={path.parent.name}\n'
+        changes[path] = before, tuned_override(base, section, settings)
+    return changes
+
+
+def tuned_cool_changes():
+    if 'cool' not in (read(CHOICES) or '').split():
+        raise ValueError('The firmware does not offer the Cool profile.')
+    return tuned_changes(tuned_profile_sources('power-saver'), 'acpi', {'platform_profile': 'cool'})
+
+
+def write_tuned_profile(path, content):
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous = path.stat() if path.exists() else None
+    with NamedTemporaryFile(mode='w', dir=path.parent, prefix='.omen-tuned-', delete_on_close=False) as temp:
+        temp.write(content)
+        temp.close()
+        if previous:
+            os.chown(temp.name, previous.st_uid, previous.st_gid)
+        os.chmod(temp.name, previous.st_mode & 0o777 if previous else 0o644)
+        os.replace(temp.name, path)
+
+
+def save_tuned_changes(changes):
+    written = []
+    try:
+        for path, (before, after) in changes.items():
+            if before == after:
+                continue
+            current = path.read_text(newline='') if path.exists() else None
+            if current != before:
+                raise RuntimeError(f'{path} changed while preparing the TuneD settings. Try again.')
+            write_tuned_profile(path, after)
+            written.append((path, before))
+    except (OSError, RuntimeError):
+        for path, before in reversed(written):
+            if before is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_tuned_profile(path, before)
+        raise
+    return {path.parent.name for path, _ in written}
+
+
+def tuned_active_profile():
+    current = run([*TUNED_BUS, 'active_profile'], timeout=6, check=False).stdout.strip()
+    return current[3:-1] if current.startswith('s "') else None
+
+
+def reload_tuned():
+    return run([*TUNED_BUS, 'reload'], timeout=28, check=False).stdout.strip() == 'b true'
+
+
+def tuned_fix_status():
+    try:
+        changes = tuned_cool_changes()
+    except (OSError, ValueError, ConfigError) as error:
+        return dict(state='unavailable', paths=[], detail=str(error))
+    applied = all(before == after for before, after in changes.values())
+    return dict(state='applied' if applied else 'available', paths=list(map(str, changes)))
+
+
+def apply_tuned_cool():
+    changed = save_tuned_changes(tuned_cool_changes())
+    if not changed:
+        print('TuneD Power Saver already selects Cool.')
+        return
+    if tuned_active_profile() in changed:
+        if not reload_tuned() or read(PROFILE) != 'cool':
+            raise RuntimeError('The Cool patch is saved. Reselect Power Saver to apply it and check the EC profile.')
+        print('TuneD Power Saver applied and EC Cool verified.')
+    else:
+        print('TuneD will select EC Cool the next time Power Saver is activated.')
+
+
+def performance_tuned_sources():
+    if read(INTEL_PSTATE / 'status') != 'active':
+        raise ValueError('The Performance clock switch requires active intel_pstate.')
+    return tuned_profile_sources('performance')
+
+
+def saved_performance_governor(sources):
+    # Only a local opt-in carries forward. Packaged Performance settings are inherited.
+    if all(tune_config(text or '', profile=True).get('cpu', 'governor', fallback=None) == 'performance'
+           for text in sources.values()):
+        return 'performance'
+    return 'powersave'
+
+
+def performance_governor_status():
+    try:
+        governor = saved_performance_governor(performance_tuned_sources())
+    except (OSError, ValueError, ConfigError) as error:
+        return dict(available=False, detail=str(error))
+    return dict(available=True, governor=governor)
+
+
+def cpu_policy_values(setting):
+    return {read(path) for path in CPUFREQ.glob(f'policy*/{setting}')}
+
+
+def performance_clocks_applied(governor):
+    minimum = number(INTEL_PSTATE / 'min_perf_pct')
+    if minimum is None or cpu_policy_values('scaling_governor') != {governor}:
+        return False
+    if governor == 'performance':
+        return minimum == 100  # intel_pstate applies EPP 0 when selecting this governor.
+    expected_epp = PERFORMANCE_CPU_SETTINGS[governor]['energy_performance_preference']
+    return minimum < 100 and cpu_policy_values('energy_performance_preference') == {expected_epp}
+
+
+def set_performance_governor(governor=None):
+    try:
+        sources = performance_tuned_sources()
+    except (OSError, ValueError, ConfigError):
+        if governor is None:  # TuneD is optional for the rest of the app.
+            return
+        raise
+    choice = governor or saved_performance_governor(sources)
+    changed = save_tuned_changes(tuned_changes(sources, 'cpu', PERFORMANCE_CPU_SETTINGS[choice]))
+    if tuned_active_profile() not in {path.parent.name for path in sources}:
+        print(f'Saved {choice} for the next time Performance mode is selected.')
+        return
+    ec_profile = read(PROFILE)
+    if changed or not performance_clocks_applied(choice):
+        if not reload_tuned():
+            raise RuntimeError(f'Saved {choice} for Performance. TuneD could not reload the profile.')
+    # Reload starts TuneD's worker asynchronously. A rollback to Balanced can
+    # briefly have the desired governor before Performance finishes applying.
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        if read(PROFILE) == ec_profile and performance_clocks_applied(choice):
+            print(f'Performance mode is using the {choice} governor.')
+            return
+        time.sleep(0.2)
+    raise RuntimeError(f'Saved {choice} for Performance. The live CPU frequency settings differ from the profile.')
+
+
+def save_profiles(kind, settings):
+    config = json.loads(settings)
+    if kind == 'CPU':
+        config = POWER['validate_cpu_profiles'](config, defaults=POWER['default_cpu_profiles']())
+    else:
+        config = POWER['validate_fan_profiles'](config)
+    path = POWER[f'{kind.upper()}_PROFILE_CONFIG']
+    path.parent.mkdir(parents=True, exist_ok=True)
+    POWER['write_control_json'](path, config)
+    print(f'{kind} profiles saved.')
+
+
+def restore_cpu_defaults():
+    POWER['default_cpu_profiles']()
+    POWER['CPU_PROFILE_CONFIG'].unlink(missing_ok=True)
+    print('CPU defaults restored.')
+
+
+def set_gpu_recovery(enabled):
+    if not current_service():
+        raise RuntimeError('Install or update the OMEN service before using Dynamic Boost recovery.')
+    setting = POWER['GPU_RECOVERY_ENABLED']
+    if enabled:
+        setting.parent.mkdir(parents=True, exist_ok=True)
+        setting.touch(mode=0o644)
+    else:
+        setting.unlink(missing_ok=True)
+    print(f'Dynamic Boost recovery {"enabled" if enabled else "disabled"}.')
+
+
+def get_status():
+    state = unit_state(SERVICE)
+    fan = next(POWER['HP_HWMON'].glob('hwmon*/pwm1_enable'), None)
+    temp = next((path.with_name('temp') for path in POWER['THERMAL'].glob('thermal_zone*/type')
+                 if read(path) == 'x86_pkg_temp'), None)
+    try:
+        controls = POWER['read_controls']()
+    except (OSError, ValueError):
+        controls = POWER['DEFAULT_CONTROLS'].copy()
+    cpu_defaults = cpu_profile_error = None
+    try:
+        cpu_defaults = POWER['default_cpu_profiles']()
+        cpu_profiles = POWER['read_cpu_profiles'](cpu_defaults)
+    except (OSError, ValueError) as error:
+        cpu_profile_error = str(error)
+        cpu_profiles = cpu_defaults
+    fan_profile_error = None
+    try:
+        fan_profiles = POWER['read_fan_profiles']()
+    except (OSError, ValueError) as error:
+        fan_profiles = POWER['default_fan_profiles']()
+        fan_profile_error = str(error)
+    journal = run([JOURNALCTL, '-b', '-u', SERVICE, '--no-pager', '-n', '18',
+                   '-o', 'short-iso', '--quiet'], check=False)
+    manual_fan = number(POWER['MANUAL_FAN'])
+    fan_driver = manual_fan is not None or module_installed('omen_fan')
+    gain_driver = gain_module_current()
+    gain_reload_pending = gain_driver and GAIN.exists() and read(GAIN.parent.parent / 'version') != POWER['SPG_MODULE_VERSION']
+    return dict(
+        model=read(DMI / 'product_name'), board=read(DMI / 'board_name'), bios=read(DMI / 'bios_version'),
+        supported=supported(), service=state, installed=installed(state), current=current_service(),
+        control_status=control_status(state), controls=controls, journal=journal.stdout.strip(),
+        powerd=unit_state('nvidia-powerd.service').get('ActiveState', 'unknown'),
+        ac=read(AC), rear=read(REAR), front=read(FRONT), profile=read(PROFILE),
+        profiles=(read(CHOICES) or '').split(), cpu_temperature=number(temp) if temp else None,
+        msr=limits('intel-rapl:0'), mmio=limits('intel-rapl-mmio:0'),
+        cpu_profiles=cpu_profiles, cpu_defaults=cpu_defaults, cpu_profile_error=cpu_profile_error,
+        cpu_max_watts=POWER['CPU_MAX_WATTS'],
+        cpu_governors=sorted(filter(None, cpu_policy_values('scaling_governor'))),
+        performance_governor=performance_governor_status(),
+        fan_mode=number(fan) if fan else None,
+        fans=[number(fan.with_name(f'fan{index}_input')) if fan else None for index in (1, 2)],
+        manual_fan=manual_fan, fan_driver=fan_driver,
+        fan_profiles=fan_profiles, fan_profile_error=fan_profile_error, tuned_fix=tuned_fix_status(),
+        ctgp=number(CTGP), gain=number(GAIN),
+        gain_steps=POWER['GAIN_STEPS'], default_gain_watts=POWER['DEFAULT_GAIN_WATTS'],
+        gain_driver=gain_driver, gain_reload_pending=gain_reload_pending,
+        gpu_recovery_enabled=POWER['GPU_RECOVERY_ENABLED'].is_file(),
+    )
+
+
+def sample_gpu():
+    result = run(['/usr/bin/nvidia-smi', '-i', '0000:01:00.0',
+                  '--query-gpu=power.draw,enforced.power.limit,utilization.gpu,pstate,clocks_event_reasons.sw_power_cap',
+                  '--format=csv,noheader'], timeout=6)
+    values = next(csv.reader(result.stdout.splitlines(), skipinitialspace=True), [])
+    if len(values) != 5:
+        raise RuntimeError('NVIDIA did not return a GPU power sample.')
+    return dict(zip(('draw', 'limit', 'utilization', 'pstate', 'power_cap'), values, strict=True))
+
+
+def set_profile(profile):
+    if profile not in (read(CHOICES) or '').split():
+        raise RuntimeError(f'The EC does not offer the {profile} profile.')
+    if Path('/usr/bin/busctl').is_file():
+        bus = ['/usr/bin/busctl', '--system', '--timeout=3s']
+        target = [PROFILE_BUS, PROFILE_OBJECT, PROFILE_BUS, 'ActiveProfile']
+        desktop = run([*bus, 'get-property', *target], check=False)
+        if desktop.returncode == 0 and desktop.stdout.strip() != f's "{PROFILES[profile]}"':
+            run([*bus, 'set-property', *target, 's', PROFILES[profile]])
+            deadline = time.monotonic() + 3
+            while read(PROFILE) != profile and time.monotonic() < deadline:
+                time.sleep(0.1)
+    if read(PROFILE) != profile:
+        PROFILE.write_text(profile + '\n')
+    if read(PROFILE) != profile:
+        raise RuntimeError(f'The EC did not select {profile}.')
+
+
+def module_installed(module):
+    return run(['/usr/sbin/modinfo', '-n', module], check=False).returncode == 0
+
+
+def gain_module_current():
+    version = run(['/usr/sbin/modinfo', '-F', 'version', 'omen_spg'], check=False).stdout.strip()
+    return version == POWER['SPG_MODULE_VERSION']
+
+
+def install_service():
+    result = subprocess.run(['/usr/bin/bash', str(SOURCE / 'install.sh'), '--reuse-modules'],
+                            timeout=1200, stdin=subprocess.DEVNULL)
+    if result.returncode == KEY_ENROLLMENT_REQUIRED:
+        return KEY_ENROLLMENT_REQUIRED
+    if result.returncode:
+        raise RuntimeError('The service could not be installed. See Operation output for details.')
+    if not current_service() or unit_state(SERVICE).get('ActiveState') != 'active':
+        raise RuntimeError('The service install did not reach the running state. Check service activity.')
+    wait_for_service()
+    print('OMEN service installed, enabled at boot, and running.')
+    set_performance_governor()
+    return 0
+
+
+def wait_for_service(*, start=False):
+    if not current_service():
+        raise RuntimeError('Install or update the OMEN service before applying these controls.')
+    if start:
+        run([SYSTEMCTL, 'start', SERVICE], timeout=30)
+    deadline = time.monotonic() + 9
+    while time.monotonic() < deadline:
+        status = unit_state(SERVICE)
+        if status.get('ActiveState') == 'active' and control_status(status):
+            return status
+        time.sleep(0.2)
+    raise RuntimeError('The OMEN service did not become ready. See its recent activity.')
+
+
+def send_controls(state, **settings):
+    request = dict(POWER['DEFAULT_CONTROLS'], **settings)
+    request['request'] = uuid4().hex
+    POWER['write_control_json'](POWER['CONTROLS'], request)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        reply = control_status(state)
+        if reply and reply['request'] == request['request']:
+            return reply['errors']
+        time.sleep(0.15)
+    raise RuntimeError('The service did not acknowledge the controls. Check its recent activity.')
+
+
+def apply_fixes():
+    if read(AC) != '1' or read(REAR) != '1':
+        if read(REAR) is None:
+            raise RuntimeError('Rear USB-C status is missing. Check USB-C recovery on the Fixes tab.')
+        raise RuntimeError('Connect the charger to the rear USB-C port to apply the Performance policy.')
+    state = wait_for_service(start=True)
+    set_profile('performance')
+    errors = send_controls(state, reapply=True)
+    if not POWER['eligible']():
+        raise RuntimeError('Rear AC Performance changed before the policy could be verified.')
+    target = (control_status(state) or {}).get('cpu_target')
+    if target is not None and not POWER['at_cpu_target'](target):
+        errors.append('CPU power-limit readbacks differ from the selected profile.')
+    if number(CTGP) != 1 or number(GAIN) != POWER['DEFAULT_GAIN_WATTS']:
+        errors.append('GPU boost readbacks are still pending. Check the Overview and service activity.')
+    report_controls('Rear AC Performance policy reapplied.', errors)
+
+
+def report_controls(message, errors):
+    print(message)
+    for error in errors:
+        print(f'Controller feedback: {error}')
+
+
+def recover_usb_c():
+    device = 'USBC000:00'
+    driver = Path('/sys/bus/platform/drivers/ucsi_acpi')
+    bound = Path('/sys/bus/platform/devices') / device / 'driver'
+    if read(AC) != '1' or read(FRONT) is not None or read(REAR) is not None:
+        raise RuntimeError('Recovery applies when system AC is online and both USB-C port readings are missing.')
+    if bound.resolve() != driver or any(Path('/sys/class/typec').iterdir()):
+        raise RuntimeError('The expected failed USB-C controller was not found.')
+    log = run([JOURNALCTL, '-k', '-b', '--no-pager', '-o', 'cat', '-n', '1',
+               '--grep=ucsi_acpi USBC000:00: error -ETIMEDOUT: PPM init failed'], check=False)
+    if 'error -ETIMEDOUT: PPM init failed' not in log.stdout:
+        raise RuntimeError('The kernel journal has no matching USB-C startup timeout on this boot.')
+    print(f'Reinitializing the USB-C controller {device}.', flush=True)
+    try:
+        (driver / 'unbind').write_text(device + '\n')
+    finally:
+        if not bound.is_symlink():
+            (driver / 'bind').write_text(device + '\n')
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if read(REAR) is not None and read(FRONT) is not None:
+            print(f'USB-C status restored. Rear AC is {"online" if read(REAR) == "1" else "offline"}.')
+            return
+        time.sleep(0.2)
+    raise RuntimeError('The USB-C ports did not register after the recovery attempt.')
+
+
+def perform(args):
+    if os.geteuid() != 0:
+        raise RuntimeError('Administrator authentication is required for hardware and service changes.')
+    if not supported():
+        if args.action == 'initialize-performance-governor':
+            return
+        raise RuntimeError('The controls support HP OMEN board 8C58, SKU 9R293EA#ABU, BIOS F.13.')
+    with open('/run/lock/omen-power-control.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another OMEN control operation is running.') from None
+        if args.action == 'install-service':
+            return install_service()
+        elif args.action == 'restart-service':
+            if not installed(unit_state(SERVICE)):
+                raise RuntimeError('Install the OMEN service first.')
+            run([SYSTEMCTL, 'restart', SERVICE], timeout=35)
+            if current_service():
+                wait_for_service()
+            print('OMEN service running.')
+        elif args.action == 'apply-fixes':
+            apply_fixes()
+        elif args.action == 'profile':
+            set_profile(args.profile)
+            print(f'EC profile set to {args.profile}.')
+        elif args.action == 'gpu-settings':
+            gain_watts = args.gain_watts if args.gain_watts is not None else POWER['read_controls']()['gain_watts']
+            errors = send_controls(wait_for_service(), ctgp=args.ctgp == 'on', gain=args.gain == 'on', gain_watts=gain_watts)
+            report_controls('GPU settings saved for this boot.', errors)
+        elif args.action == 'reset-gpu-settings':
+            errors = send_controls(wait_for_service())
+            report_controls('Default GPU settings restored.', errors)
+        elif args.action == 'recover-usb-c':
+            recover_usb_c()
+        elif args.action == 'save-fan-profiles':
+            save_profiles('Fan', args.settings)
+        elif args.action == 'save-cpu-profiles':
+            save_profiles('CPU', args.settings)
+        elif args.action == 'restore-cpu-defaults':
+            restore_cpu_defaults()
+        elif args.action == 'initialize-performance-governor':
+            set_performance_governor()
+        elif args.action == 'performance-governor':
+            set_performance_governor(args.governor)
+        elif args.action == 'apply-tuned-cool':
+            apply_tuned_cool()
+        elif args.action == 'gpu-recovery':
+            set_gpu_recovery(args.setting == 'on')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='action', required=True)
+    for action in ('status', 'sample-gpu', 'install-service', 'restart-service', 'apply-fixes', 'reset-gpu-settings',
+                   'recover-usb-c', 'apply-tuned-cool', 'restore-cpu-defaults', 'initialize-performance-governor'):
+        commands.add_parser(action)
+    commands.add_parser('save-fan-profiles').add_argument('settings')
+    commands.add_parser('save-cpu-profiles').add_argument('settings')
+    commands.add_parser('performance-governor').add_argument('governor', choices=PERFORMANCE_CPU_SETTINGS)
+    commands.add_parser('profile').add_argument('profile', choices=PROFILES)
+    commands.add_parser('gpu-recovery').add_argument('setting', choices=('on', 'off'))
+    gpu = commands.add_parser('gpu-settings')
+    for name in ('ctgp', 'gain'):
+        gpu.add_argument('--' + name, choices=('on', 'off'), required=True)
+    gpu.add_argument('--gain-watts', type=int, choices=POWER['GAIN_STEPS'])
+    args = parser.parse_args()
+    try:
+        if args.action == 'status':
+            print(json.dumps(get_status()))
+        elif args.action == 'sample-gpu':
+            print(json.dumps(sample_gpu()))
+        else:
+            return perform(args) or 0
+    except (OSError, RuntimeError, ValueError, ConfigError, subprocess.SubprocessError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

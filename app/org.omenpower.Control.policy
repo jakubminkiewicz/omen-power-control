@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "https://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>OMEN Power Control</vendor>
+  <action id="org.omenpower.Control.manage">
+    <description>Manage the OMEN power service and settings</description>
+    <message>Administrator authentication is required to manage OMEN power controls</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/omen-control/omen-control-helper</annotate>
+  </action>
+</policyconfig>

@@ -1,0 +1,63 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:45
+    steps:
+      - name: Install build tools
+        run: dnf install -y git-core rpm-build desktop-file-utils python3 findutils tar gzip
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build Fedora RPM
+        id: rpm
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          ./packaging/build-rpm.sh "$version"
+          printf 'directory=dist/%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fedora-rpm
+          path: ${{ steps.rpm.outputs.directory }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: fedora-rpm
+          path: release-assets
+      - name: Publish the release assets
+        working-directory: release-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum -c SHA256SUMS
+          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)
+          case "$draft" in
+            true)
+              gh release upload "$TAG" ./*.rpm SHA256SUMS --clobber
+              gh release edit "$TAG" --draft=false
+              ;;
+            false) printf 'Release %s is already published.\n' "$TAG" ;;
+            *) gh release create "$TAG" ./*.rpm SHA256SUMS --verify-tag --generate-notes \
+                 --title "OMEN Power Control $TAG" ;;
+          esac

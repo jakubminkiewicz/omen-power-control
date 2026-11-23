@@ -1,0 +1,24 @@
+[Unit]
+Description=HP OMEN CPU profiles, fan control and rear-AC GPU boost
+After=systemd-udevd.service tuned.service thermald.service akmods.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/omen-ac-power.py
+ExecStopPost=-/usr/bin/sh -c 'if test -e /sys/module/omen_fan/parameters/fan_percent; then echo 0 > /sys/module/omen_fan/parameters/fan_percent; fi'
+ExecStopPost=-/usr/bin/sh -c 'if test -e /sys/module/omen_spg/parameters/gain_watts; then echo 0 > /sys/module/omen_spg/parameters/gain_watts; fi'
+ExecStopPost=-/usr/bin/sh -c 'if test -e /sys/module/omen_ctgp/parameters/ctgp; then echo 0 > /sys/module/omen_ctgp/parameters/ctgp; fi'
+ExecStopPost=-/usr/bin/timeout --kill-after=2s 6s /usr/bin/python3 -I /usr/local/libexec/omen-gpu-recovery.py --release
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=omen-ac-power
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=restart
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

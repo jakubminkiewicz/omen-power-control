@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "Cool": { "pl1": 10, "pl2": 50, "pl4": 100 },
+    "Balanced": { "pl1": 40, "pl2": 80, "pl4": 120 },
+    "Performance": { "pl1": 65, "pl2": 80, "pl4": 120 }
+  },
+  "assignments": {
+    "cool": "Cool",
+    "balanced": "Balanced",
+    "performance": "Performance"
+  }
+}
